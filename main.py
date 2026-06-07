@@ -72,6 +72,17 @@ def build_export(state: BoardState) -> dict:
     nets     = state.compute_nets()
     gnd_ids  = state.gnd_net_ids(nets)
 
+    # Run safety checks
+    issues = state.analyze_safety()
+    safety_data = []
+    for issue in issues:
+        safety_data.append({
+            "severity": issue.severity,
+            "message":  issue.message,
+            "net_id":   issue.net_id,
+            "comp_id":  issue.comp_id
+        })
+
     # Helper: find net id for a CP
     def net_of(cp):
         for nid, cps in nets.items():
@@ -177,6 +188,8 @@ def build_export(state: BoardState) -> dict:
             "on_board":     pc.on_board,
             "anchor_row":   pc.anchor_row if pc.on_board else None,
             "anchor_col":   pc.anchor_col if pc.on_board else None,
+            "rotated":      getattr(pc, "rotated", False),
+            "flipped":      getattr(pc, "flipped", False),
             "gnd_warning":  expects_gnd and not gnd_pins_ok,
             "pins":         pins_info,
         })
@@ -194,6 +207,7 @@ def build_export(state: BoardState) -> dict:
         },
         "components": component_list,
         "nets":        net_descriptions,
+        "safety_issues": safety_data,
     }
 
 
@@ -313,6 +327,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._set_mode(MODE_SELECT)   # initialise button highlight state
+        self._refresh_netlist()
         self._ask_controller()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -334,7 +349,8 @@ class App(tk.Tk):
         self._build_sidebar(left)
 
         self._bcanvas = BreadboardCanvas(paned, self.state,
-                                          on_status=self._set_status)
+                                          on_status=self._set_status,
+                                          on_change=self._refresh_netlist)
         paned.add(self._bcanvas, minsize=600)
 
         right = tk.Frame(paned, width=220)
@@ -455,10 +471,15 @@ class App(tk.Tk):
         self._filter_list("")
 
     def _build_right_panel(self, parent) -> None:
-        tk.Label(parent, text="Info / Nets", font=("Helvetica", 10, "bold"),
+        tk.Label(parent, text="Info / Rules / Nets", font=("Helvetica", 10, "bold"),
                  bg="#ECEFF1").pack(fill=tk.X, ipady=4)
         self._info_text = tk.Text(parent, font=("Helvetica", 8), state=tk.DISABLED,
                                    wrap=tk.WORD, bg="#FAFAFA")
+        self._info_text.tag_configure("critical", foreground="#D32F2F", font=("Helvetica", 8, "bold"))
+        self._info_text.tag_configure("warning", foreground="#F57C00", font=("Helvetica", 8, "bold"))
+        self._info_text.tag_configure("ok", foreground="#388E3C", font=("Helvetica", 8, "bold"))
+        self._info_text.tag_configure("header", font=("Helvetica", 9, "bold"))
+
         vsb = tk.Scrollbar(parent, command=self._info_text.yview)
         self._info_text.configure(yscrollcommand=vsb.set)
         self._info_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
@@ -562,6 +583,22 @@ class App(tk.Tk):
     # ── Netlist panel ─────────────────────────────────────────────────────────
 
     def _refresh_netlist(self) -> None:
+        self._info_text.configure(state=tk.NORMAL)
+        self._info_text.delete("1.0", tk.END)
+
+        # ── 1. Safety analysis ────────────────────────────────────────────────
+        self._info_text.insert(tk.END, "=== SAFETY RULES ===\n", "header")
+        issues = self.state.analyze_safety()
+        if not issues:
+            self._info_text.insert(tk.END, "✔ All checks passed. No issues detected.\n\n", "ok")
+        else:
+            for issue in issues:
+                prefix = "⚠ CRITICAL: " if issue.severity == "critical" else "⚠ WARNING: "
+                tag = issue.severity
+                self._info_text.insert(tk.END, f"{prefix}{issue.message}\n\n", tag)
+
+        # ── 2. Netlist ────────────────────────────────────────────────────────
+        self._info_text.insert(tk.END, "=== NETS & CONNECTIONS ===\n", "header")
         nets    = self.state.compute_nets()
         gnd_ids = self.state.gnd_net_ids(nets)
         lines   = []
@@ -587,8 +624,6 @@ class App(tk.Tk):
             lines.append("")
 
         text = "\n".join(lines) if lines else "No notable nets yet."
-        self._info_text.configure(state=tk.NORMAL)
-        self._info_text.delete("1.0", tk.END)
         self._info_text.insert(tk.END, text)
         self._info_text.configure(state=tk.DISABLED)
 
@@ -599,6 +634,23 @@ class App(tk.Tk):
             messagebox.showinfo("Nothing to export",
                                 "Place at least one component first.")
             return
+
+        # Safety validation checks before exporting
+        issues = self.state.analyze_safety()
+        if issues:
+            critical_msgs = [f"  • {i.message}" for i in issues if i.severity == "critical"]
+            warning_msgs  = [f"  • {i.message}" for i in issues if i.severity == "warning"]
+
+            err_msg = ""
+            if critical_msgs:
+                err_msg += "CRITICAL SAFETY ERRORS:\n" + "\n".join(critical_msgs) + "\n\n"
+            if warning_msgs:
+                err_msg += "SAFETY WARNINGS:\n" + "\n".join(warning_msgs) + "\n\n"
+
+            err_msg += "Do you want to proceed with the export anyway?"
+            if not messagebox.askyesno("Safety Validation Failed", err_msg):
+                return
+
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON", "*.json"), ("All files", "*.*")],
@@ -619,6 +671,7 @@ class App(tk.Tk):
             msg += "\n\n⚠ GND not connected for:\n" + "\n".join(warnings)
         messagebox.showinfo("Export complete", msg)
         self._set_status(f"Exported → {path}")
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

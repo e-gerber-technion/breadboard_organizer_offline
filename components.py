@@ -278,6 +278,17 @@ BUZZER_TMB12A03 = ComponentDef(
     description = "TMB12A03 active buzzer – 3 V, 12 mm",
 )
 
+RESISTOR = ComponentDef(
+    type_name = "Resistor",
+    category  = "passive",
+    color     = "#D7CCC8",
+    left_pins = [
+        P("1"),
+        P("2"),
+    ],
+    description = "Resistor – restricts current flow. Connect in series with LEDs.",
+)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Registry
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -291,6 +302,7 @@ ALL_COMPONENTS: List[ComponentDef] = [
     LED_BLUE,
     LED_RED,
     BUZZER_TMB12A03,
+    RESISTOR,
 ]
 
 CONTROLLERS    = [c for c in ALL_COMPONENTS if c.category == "controller"]

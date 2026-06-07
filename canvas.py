@@ -188,10 +188,12 @@ class BreadboardCanvas(tk.Frame):
     """
 
     def __init__(self, parent, state: BoardState,
-                 on_status: Callable[[str], None] = None, **kw):
+                 on_status: Callable[[str], None] = None,
+                 on_change: Callable[[], None] = None, **kw):
         super().__init__(parent, **kw)
         self.state     = state
         self.on_status = on_status or (lambda s: None)
+        self.on_change = on_change or (lambda: None)
 
         # Zoom & board position
         self._zoom      = 1.0
@@ -249,6 +251,9 @@ class BreadboardCanvas(tk.Frame):
         c.bind("<Button-3>",        self._on_right_click)
         c.bind("<Escape>",          self._on_escape)
         c.bind("<Delete>",          self._on_delete_key)
+        c.bind("<Key-r>",           self._on_rotate_key)
+        c.bind("<Key-R>",           self._on_rotate_key)
+        c.bind("<space>",           self._on_rotate_key)
         # Ctrl+scroll → zoom
         c.bind("<Control-MouseWheel>", self._on_zoom_scroll)
         c.bind("<Control-Button-4>",   self._on_zoom_scroll)
@@ -269,6 +274,7 @@ class BreadboardCanvas(tk.Frame):
     def set_mode(self, mode: str, placing_def=None) -> None:
         self._mode        = mode
         self._placing_def = placing_def
+        self._placing_rotated = False
         self._wire_start  = None
         self._drag_comp   = None
         cursor_map = {
@@ -501,15 +507,27 @@ class BreadboardCanvas(tk.Frame):
                                   tags=f"comp_{pc.inst_id}")
         else:
             # ── DIP: straddles the centre gap ─────────────────────────────────
-            n_rows = cd.height_in_rows
-            lx, ly = lay.hole_xy(pc.anchor_row, pc.anchor_col)
-            rc      = MIRROR_COL[pc.anchor_col]
-            rx, _   = lay.hole_xy(pc.anchor_row, rc)
-            y1      = lay.hole_xy(pc.anchor_row + n_rows - 1, pc.anchor_col)[1]
-            pad     = hs * 0.45
-            bx0, by0 = min(lx, rx) - pad, ly - pad
-            bx1, by1 = max(lx, rx) + pad, y1 + pad
-            mid_x    = (bx0 + bx1) / 2
+            rotated = getattr(pc, "rotated", False)
+            if rotated:
+                holes = pc.all_occupied_holes()
+                if not holes:
+                    return
+                xs = [lay.hole_xy(r, col)[0] for r, col in holes]
+                ys = [lay.hole_xy(r, col)[1] for r, col in holes]
+                pad = hs * 0.45
+                bx0, by0 = min(xs) - pad, min(ys) - pad
+                bx1, by1 = max(xs) + pad, max(ys) + pad
+                mid_x = (bx0 + bx1) / 2
+            else:
+                n_rows = cd.height_in_rows
+                lx, ly = lay.hole_xy(pc.anchor_row, pc.anchor_col)
+                rc      = MIRROR_COL[pc.anchor_col]
+                rx, _   = lay.hole_xy(pc.anchor_row, rc)
+                y1      = lay.hole_xy(pc.anchor_row + n_rows - 1, pc.anchor_col)[1]
+                pad     = hs * 0.45
+                bx0, by0 = min(lx, rx) - pad, ly - pad
+                bx1, by1 = max(lx, rx) + pad, y1 + pad
+                mid_x    = (bx0 + bx1) / 2
 
             ow = 3 if sel else 1
             oc = C_SELECTION if sel else C_COMP_OUTLINE
@@ -525,7 +543,7 @@ class BreadboardCanvas(tk.Frame):
             # ── Pin-1 gold stripe ─────────────────────────────────────────────
             # Drawn on whichever column pin[0] occupies after flip.
             pin0_hole = pc.pin_holes.get(pc.pin_key(0))
-            if pin0_hole:
+            if pin0_hole and not rotated:
                 _, p0_col = pin0_hole
                 sw = max(3.0, hs * 0.14)   # stripe width
                 if p0_col in LEFT_COLS:
@@ -538,12 +556,11 @@ class BreadboardCanvas(tk.Frame):
                                        tags=f"comp_{pc.inst_id}")
 
             # ── Pin dots + labels ─────────────────────────────────────────────
-            # Labels are aligned to the BODY WALL on each side.  When the
-            # component is flipped, pin names literally switch body halves –
-            # the swap is immediately obvious.
             lbl_fnt = ("Helvetica", max(6, int(7 * z)))
             left_tx  = bx0 + hs * 0.55    # left-side  labels start here →
             right_tx = bx1 - hs * 0.55    # right-side labels end   here ←
+            top_ty    = by0 + hs * 0.55
+            bottom_ty = by1 - hs * 0.55
 
             for i, (label, cp) in enumerate(pc.connection_points()):
                 if cp[0] != "hole":
@@ -554,16 +571,27 @@ class BreadboardCanvas(tk.Frame):
                               hx + hr + 1, hy + hr + 1,
                               fill=C_PIN_DOT, outline=cd.color,
                               tags=("hole_pin", f"hp_{pc.inst_id}_{i}"))
-                # Choose side based on which column the hole is in RIGHT NOW
-                # (reflects flip correctly without any extra state check)
-                if cp[2] in LEFT_COLS:
-                    c.create_text(left_tx, hy, text=label, font=lbl_fnt,
-                                  fill=tc, anchor="w",
-                                  tags=f"comp_{pc.inst_id}")
+                
+                if rotated:
+                    if cp[1] == pc.anchor_row:
+                        c.create_text(hx, top_ty, text=label, font=lbl_fnt,
+                                      fill=tc, anchor="n",
+                                      tags=f"comp_{pc.inst_id}")
+                    else:
+                        c.create_text(hx, bottom_ty, text=label, font=lbl_fnt,
+                                      fill=tc, anchor="s",
+                                      tags=f"comp_{pc.inst_id}")
                 else:
-                    c.create_text(right_tx, hy, text=label, font=lbl_fnt,
-                                  fill=tc, anchor="e",
-                                  tags=f"comp_{pc.inst_id}")
+                    # Choose side based on which column the hole is in RIGHT NOW
+                    # (reflects flip correctly without any extra state check)
+                    if cp[2] in LEFT_COLS:
+                        c.create_text(left_tx, hy, text=label, font=lbl_fnt,
+                                      fill=tc, anchor="w",
+                                      tags=f"comp_{pc.inst_id}")
+                    else:
+                        c.create_text(right_tx, hy, text=label, font=lbl_fnt,
+                                      fill=tc, anchor="e",
+                                      tags=f"comp_{pc.inst_id}")
 
     def _draw_offboard_component(self, pc: PlacedComponent) -> None:
         c   = self._canvas
@@ -930,7 +958,7 @@ class BreadboardCanvas(tk.Frame):
             snap = lay.nearest_hole(tx, ty)
             if snap:
                 new_row, new_col = snap
-                if new_col in RIGHT_COLS:
+                if pc.comp_def.category == "controller" and new_col in RIGHT_COLS:
                     new_col = MIRROR_COL[new_col]
                 if new_row != pc.anchor_row or new_col != pc.anchor_col:
                     pc.anchor_row = new_row
@@ -953,7 +981,7 @@ class BreadboardCanvas(tk.Frame):
             snap = lay.nearest_hole(cx - self._drag_off[0], cy - self._drag_off[1])
             if snap:
                 new_row, new_col = snap
-                if new_col in RIGHT_COLS:
+                if pc.comp_def.category == "controller" and new_col in RIGHT_COLS:
                     new_col = MIRROR_COL[new_col]
                 self.state.move_component_on_board(pc.inst_id, new_row, new_col)
         else:
@@ -969,21 +997,22 @@ class BreadboardCanvas(tk.Frame):
         lay = self.layout
         occ = self.state.occupied_holes()
         cd  = self._placing_def
+        rotated = getattr(self, "_placing_rotated", False)
 
         if lay.board_hit(cx, cy):
             snap = lay.nearest_hole(cx, cy)
             if snap:
                 row, col = snap
-                if col in RIGHT_COLS:
+                if cd.category == "controller" and col in RIGHT_COLS:
                     col = MIRROR_COL[col]
                 test_pc = PlacedComponent("_test", cd, on_board=True,
-                                         anchor_row=row, anchor_col=col)
+                                         anchor_row=row, anchor_col=col, rotated=rotated)
                 test_pc.compute_pin_holes()
                 candidate = test_pc.all_occupied_holes()
                 if all(h not in occ and 1 <= h[0] <= lay.num_rows
                        and h[1] in ALL_COLS for h in candidate):
                     self.state.add_component(cd, on_board=True,
-                                             anchor_row=row, anchor_col=col)
+                                             anchor_row=row, anchor_col=col, rotated=rotated)
                     self.on_status(f"Placed {cd.type_name} at row {row}, col {col}")
                 else:
                     self.on_status("Cannot place here – holes occupied or out of range")
@@ -992,7 +1021,7 @@ class BreadboardCanvas(tk.Frame):
             wx, wy = lay.to_world(cx - 60, cy - 30)
             min_wx = lay.offboard_default_world_x()
             wx = max(wx, min_wx)
-            self.state.add_component(cd, on_board=False, x=wx, y=wy)
+            self.state.add_component(cd, on_board=False, x=wx, y=wy, rotated=rotated)
             self.on_status(f"Placed {cd.type_name} off-board")
 
         self._canvas.delete("ghost")
@@ -1086,14 +1115,12 @@ class BreadboardCanvas(tk.Frame):
         if not snap:
             return
         row, col = snap
-        if col in RIGHT_COLS:
+        rotated = getattr(self, "_placing_rotated", False)
+        if cd.category == "controller" and col in RIGHT_COLS:
             col = MIRROR_COL[col]
-        l_col = col
-        r_col = MIRROR_COL[col]
-        ghost_holes = (
-            [(row + i, l_col) for i in range(len(cd.left_pins))] +
-            [(row + i, r_col) for i in range(len(cd.right_pins))]
-        )
+        temp_pc = PlacedComponent("_temp", cd, on_board=True, anchor_row=row, anchor_col=col, rotated=rotated)
+        temp_pc.compute_pin_holes()
+        ghost_holes = temp_pc.all_occupied_holes()
         valid = all(
             h not in occ and 1 <= h[0] <= lay.num_rows and h[1] in ALL_COLS
             for h in ghost_holes
@@ -1130,6 +1157,9 @@ class BreadboardCanvas(tk.Frame):
             if comp.comp_def.is_dip:
                 menu.add_command(label="Flip left ↔ right",
                                  command=lambda: self._ctx_flip(comp.inst_id))
+            if comp.comp_def.category != "controller":
+                menu.add_command(label="Rotate 90°",
+                                 command=lambda: self._ctx_rotate(comp.inst_id))
             menu.add_separator()
             menu.add_command(label="Move off-board",
                              command=lambda: self._ctx_move_off(comp.inst_id))
@@ -1182,4 +1212,31 @@ class BreadboardCanvas(tk.Frame):
         if color:
             w.color = color
             self.redraw()
+
+    def _ctx_rotate(self, inst_id: str) -> None:
+        pc = self.state.get_component(inst_id)
+        if pc:
+            pc.rotated = not getattr(pc, "rotated", False)
+            pc.compute_pin_holes()
+            self.redraw()
+            self.on_change()
+
+    def _on_rotate_key(self, event) -> None:
+        if self._mode == MODE_PLACE:
+            self._placing_rotated = not getattr(self, "_placing_rotated", False)
+            try:
+                raw_x = self._canvas.winfo_pointerx() - self._canvas.winfo_rootx()
+                raw_y = self._canvas.winfo_pointery() - self._canvas.winfo_rooty()
+                cx = self._canvas.canvasx(raw_x)
+                cy = self._canvas.canvasy(raw_y)
+                self._draw_ghost(cx, cy)
+            except Exception:
+                pass
+        elif self._mode == MODE_SELECT and self._selected_comp:
+            pc = self.state.get_component(self._selected_comp)
+            if pc and pc.comp_def.category != "controller":
+                pc.rotated = not getattr(pc, "rotated", False)
+                pc.compute_pin_holes()
+                self.redraw()
+                self.on_change()
 

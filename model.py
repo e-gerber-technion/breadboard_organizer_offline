@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from components import ComponentDef, PinDef, PT_GND
+from components import ComponentDef, PinDef, PT_GND, PT_POWER
 from constants import (
     ALL_COLS, LEFT_COLS, RIGHT_COLS, MIRROR_COL,
     ALL_RAILS,
@@ -30,6 +30,14 @@ def pin_cp(inst_id: str, pin_name: str) -> CP:
     return ("pin", inst_id, pin_name)
 
 
+@dataclass
+class SafetyIssue:
+    severity: str  # "critical" | "warning"
+    message: str
+    comp_id: Optional[str] = None
+    net_id: Optional[int] = None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PlacedComponent
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -45,10 +53,13 @@ class PlacedComponent:
     anchor_row: int  = 1     # row of first left pin (1-indexed)
     anchor_col: str  = 'b'   # column of first left pin
     flipped:    bool = False  # flip left↔right sides (only relevant for DIP)
+    rotated:    bool = False  # rotate 90 degrees (essential for button placement on same side)
 
     # Off-board placement (canvas world coordinates, top-left of the component box)
     x: float = 200.0
     y: float = 200.0
+
+    resistance: float = 220.0
 
     # ── derived pin→hole mapping (populated by compute_pin_holes) ─────────────
     # pin_holes[pin_name_unique_key] = (row, col)  or None for off-board pins
@@ -58,6 +69,17 @@ class PlacedComponent:
         """A stable key for a pin based on its index in all_pins."""
         return f"{self.inst_id}__{pin_index}"
 
+    def get_right_column(self, l_col: str) -> str:
+        if self.comp_def.type_name == "4-Pin Button":
+            try:
+                idx = ALL_COLS.index(l_col)
+                r_idx = min(idx + 2, len(ALL_COLS) - 1)
+                return ALL_COLS[r_idx]
+            except ValueError:
+                return l_col
+        else:
+            return MIRROR_COL.get(l_col, l_col)
+
     def compute_pin_holes(self) -> None:
         """Populate self.pin_holes based on placement position."""
         self.pin_holes.clear()
@@ -66,24 +88,45 @@ class PlacedComponent:
 
         cd = self.comp_def
         l_col = self.anchor_col
-        r_col = MIRROR_COL.get(l_col, l_col)
+        r_col = self.get_right_column(l_col)
 
         # Determine which side goes where when flipped
         if self.flipped and cd.is_dip:
             l_col, r_col = r_col, l_col
 
-        # Left-side pins
-        for i, pin in enumerate(cd.left_pins):
-            row = self.anchor_row + i
-            key = self.pin_key(i)
-            self.pin_holes[key] = (row, l_col)
+        if self.rotated:
+            if cd.type_name == "4-Pin Button":
+                # Rotated pushbutton spans rows:
+                # Side A (pins 0, 1) are at anchor_row, in l_col and r_col
+                # Side B (pins 2, 3) are at anchor_row + 2, in l_col and r_col
+                self.pin_holes[self.pin_key(0)] = (self.anchor_row, l_col)
+                self.pin_holes[self.pin_key(1)] = (self.anchor_row, r_col)
+                self.pin_holes[self.pin_key(2)] = (self.anchor_row + 2, l_col)
+                self.pin_holes[self.pin_key(3)] = (self.anchor_row + 2, r_col)
+            else:
+                # Place all pins horizontally starting from anchor_col
+                try:
+                    start_idx = ALL_COLS.index(l_col)
+                except ValueError:
+                    start_idx = 0
+                for i, pin in enumerate(cd.all_pins):
+                    col_idx = min(start_idx + i, len(ALL_COLS) - 1)
+                    col = ALL_COLS[col_idx]
+                    key = self.pin_key(i)
+                    self.pin_holes[key] = (self.anchor_row, col)
+        else:
+            # Left-side pins
+            for i, pin in enumerate(cd.left_pins):
+                row = self.anchor_row + i
+                key = self.pin_key(i)
+                self.pin_holes[key] = (row, l_col)
 
-        # Right-side pins
-        offset = len(cd.left_pins)
-        for i, pin in enumerate(cd.right_pins):
-            row = self.anchor_row + i
-            key = self.pin_key(offset + i)
-            self.pin_holes[key] = (row, r_col)
+            # Right-side pins
+            offset = len(cd.left_pins)
+            for i, pin in enumerate(cd.right_pins):
+                row = self.anchor_row + i
+                key = self.pin_key(offset + i)
+                self.pin_holes[key] = (row, r_col)
 
     def all_occupied_holes(self) -> List[Tuple[int, str]]:
         """Return all (row, col) holes this component occupies."""
@@ -159,12 +202,13 @@ class BoardState:
                       on_board: bool = False,
                       anchor_row: int = 1,
                       anchor_col: str = 'b',
-                      x: float = 200, y: float = 200) -> PlacedComponent:
+                      x: float = 200, y: float = 200,
+                      rotated: bool = False) -> PlacedComponent:
         inst_id = self.new_comp_id()
         pc = PlacedComponent(
             inst_id=inst_id, comp_def=comp_def,
             on_board=on_board, anchor_row=anchor_row, anchor_col=anchor_col,
-            x=x, y=y,
+            x=x, y=y, rotated=rotated
         )
         pc.compute_pin_holes()
         self.components.append(pc)
@@ -373,3 +417,298 @@ class BoardState:
                     to_remove.append(pc.inst_id)
         for iid in to_remove:
             self.remove_component(iid)
+
+    def analyze_safety(self) -> List[SafetyIssue]:
+        issues: List[SafetyIssue] = []
+        nets = self.compute_nets()
+
+        # Map each connection point (CP) to its net ID
+        cp_to_net: Dict[CP, int] = {}
+        for nid, cps in nets.items():
+            for cp in cps:
+                cp_to_net[cp] = nid
+
+        # ── 1. Direct Short Circuits & Power Conflicts ────────────────────────
+        # Group each net's microcontroller pins by type and name
+        for nid, cps in sorted(nets.items()):
+            gnd_pins = []
+            power_pins = []
+            io_pins = []
+
+            for cp in cps:
+                if cp[0] == "pin":
+                    # Offboard component pin
+                    inst_id, pin_key = cp[1], cp[2]
+                    pc = self.get_component(inst_id)
+                    if pc and pc.comp_def.category == "controller":
+                        pin_idx = int(pin_key.split("__")[0])
+                        pin_def = pc.comp_def.all_pins[pin_idx]
+                        if pin_def.ptype == PT_GND:
+                            gnd_pins.append((pc, pin_def))
+                        elif pin_def.ptype == PT_POWER:
+                            power_pins.append((pc, pin_def))
+                        else:
+                            io_pins.append((pc, pin_def))
+                elif cp[0] == "hole":
+                    # Onboard component pin (we check if a controller pin maps to this hole)
+                    row, col = cp[1], cp[2]
+                    for pc in self.components:
+                        if pc.comp_def.category == "controller" and pc.on_board:
+                            for i, (label, cp_pin) in enumerate(pc.connection_points()):
+                                if cp_pin == cp:
+                                    pin_def = pc.comp_def.all_pins[i]
+                                    if pin_def.ptype == PT_GND:
+                                        gnd_pins.append((pc, pin_def))
+                                    elif pin_def.ptype == PT_POWER:
+                                        power_pins.append((pc, pin_def))
+                                    else:
+                                        io_pins.append((pc, pin_def))
+
+            # Rules for direct short-circuit:
+            if gnd_pins and power_pins:
+                power_labels = ", ".join(f"{pc.comp_def.type_name} {pin.name}" for pc, pin in power_pins)
+                gnd_labels = ", ".join(f"{pc.comp_def.type_name} {pin.name}" for pc, pin in gnd_pins)
+                issues.append(SafetyIssue(
+                    severity="critical",
+                    message=f"Direct Short Circuit in Net {nid}! Power ({power_labels}) is connected directly to Ground ({gnd_labels}).",
+                    net_id=nid
+                ))
+
+            # Rule for power supply voltage conflicts:
+            if len(power_pins) > 1:
+                # Group power pins by normalized voltage
+                # (e.g. 5V -> 5.0, 3.3V/3V3 -> 3.3, VIN -> 9.0)
+                voltage_groups = {}
+                for pc, pin in power_pins:
+                    name = pin.name.upper()
+                    if "5V" in name:
+                        voltage = 5.0
+                    elif "3.3V" in name or "3V3" in name:
+                        voltage = 3.3
+                    elif "VIN" in name:
+                        voltage = 9.0
+                    else:
+                        voltage = 5.0  # default assumption
+                    voltage_groups.setdefault(voltage, []).append((pc, pin))
+
+                if len(voltage_groups) > 1:
+                    conflict_desc = []
+                    for volt, list_pins in sorted(voltage_groups.items()):
+                        pins_desc = ", ".join(f"{pc.comp_def.type_name} {p.name}" for pc, p in list_pins)
+                        conflict_desc.append(f"{volt}V ({pins_desc})")
+                    issues.append(SafetyIssue(
+                        severity="critical",
+                        message=f"Power Rail Conflict in Net {nid}! Different voltages are connected together: {'; '.join(conflict_desc)}.",
+                        net_id=nid
+                    ))
+
+        # ── 2. LED Overload Verification (Series Resistor Check) ──────────────
+        # Build adjacency list for nets connected via Resistors
+        # Adjacency list format: net_id -> list of (neighbor_net_id, resistance)
+        resistors = [pc for pc in self.components if pc.comp_def.type_name == "Resistor"]
+        adj: Dict[int, List[Tuple[int, float]]] = {}
+        for r in resistors:
+            rcps = r.connection_points()
+            if len(rcps) >= 2:
+                cp0, cp1 = rcps[0][1], rcps[1][1]
+                n0 = cp_to_net.get(cp0)
+                n1 = cp_to_net.get(cp1)
+                r_val = getattr(r, "resistance", 220.0)
+                if n0 is not None and n1 is not None and n0 != n1:
+                    adj.setdefault(n0, []).append((n1, r_val))
+                    adj.setdefault(n1, []).append((n0, r_val))
+
+        # Helper to find minimum resistor distance/resistance to other nets (Dijkstra)
+        def find_path_resistance(start_nid: int) -> Dict[int, float]:
+            import heapq
+            queue = [(0.0, start_nid)]
+            visited = {start_nid: 0.0}
+            while queue:
+                r_sum, curr = heapq.heappop(queue)
+                if r_sum > visited.get(curr, float('inf')):
+                    continue
+                for neighbor, res_val in adj.get(curr, []):
+                    new_r = r_sum + res_val
+                    if new_r < visited.get(neighbor, float('inf')):
+                        visited[neighbor] = new_r
+                        heapq.heappush(queue, (new_r, neighbor))
+            return visited
+
+        # Check each LED
+        leds = [pc for pc in self.components if pc.comp_def.category == "led"]
+        for led in leds:
+            lcps = led.connection_points()
+            if len(lcps) < 2:
+                continue
+            anode_cp, cathode_cp = lcps[0][1], lcps[1][1]
+            anode_net = cp_to_net.get(anode_cp)
+            cathode_net = cp_to_net.get(cathode_cp)
+
+            if anode_net is None or cathode_net is None:
+                # LED is disconnected on one or both sides
+                continue
+
+            # Find all nets reachable via resistors from anode and cathode
+            anode_res = find_path_resistance(anode_net)
+            cathode_res = find_path_resistance(cathode_net)
+
+            # Check if there is any power source (or GPIO pin) connected to the anode/cathode side,
+            # and any ground (or GPIO pin) connected to the cathode/anode side.
+            correct_power = []
+            correct_gnd = []
+            reverse_power = []
+            reverse_gnd = []
+
+            # Search all nets in the system
+            for nid, cps in nets.items():
+                has_power = False
+                has_gnd = False
+                for cp in cps:
+                    # Check controller pins
+                    if cp[0] == "pin":
+                        inst_id, pin_key = cp[1], cp[2]
+                        pc = self.get_component(inst_id)
+                        if pc and pc.comp_def.category == "controller":
+                            pin_idx = int(pin_key.split("__")[0])
+                            ptype = pc.comp_def.all_pins[pin_idx].ptype
+                            if ptype == PT_POWER:
+                                has_power = True
+                            elif ptype == PT_GND:
+                                has_gnd = True
+                            else:
+                                # GPIO is potential power & GND
+                                has_power = True
+                                has_gnd = True
+                    elif cp[0] == "hole":
+                        for pc in self.components:
+                            if pc.comp_def.category == "controller" and pc.on_board:
+                                for i, (label, cp_pin) in enumerate(pc.connection_points()):
+                                    if cp_pin == cp:
+                                        ptype = pc.comp_def.all_pins[i].ptype
+                                        if ptype == PT_POWER:
+                                            has_power = True
+                                        elif ptype == PT_GND:
+                                            has_gnd = True
+                                        else:
+                                            has_power = True
+                                            has_gnd = True
+
+                if has_power:
+                    if nid in anode_res:
+                        correct_power.append((nid, anode_res[nid]))
+                    if nid in cathode_res:
+                        reverse_power.append((nid, cathode_res[nid]))
+                if has_gnd:
+                    if nid in cathode_res:
+                        correct_gnd.append((nid, cathode_res[nid]))
+                    if nid in anode_res:
+                        reverse_gnd.append((nid, anode_res[nid]))
+
+            if correct_power and correct_gnd:
+                # Find minimum resistance over all power/GND path pairs
+                min_res_val = min(
+                    p_res + g_res for _, p_res in correct_power for _, g_res in correct_gnd
+                )
+                if min_res_val < 100.0:
+                    if min_res_val == 0.0:
+                        issues.append(SafetyIssue(
+                            severity="warning",
+                            message=f"Overload Hazard! LED '{led.comp_def.type_name}' ({led.inst_id}) is connected directly between power/GPIO and ground without a current-limiting series resistor.",
+                            comp_id=led.inst_id
+                        ))
+                    else:
+                        issues.append(SafetyIssue(
+                            severity="warning",
+                            message=f"Overload Hazard! LED '{led.comp_def.type_name}' ({led.inst_id}) series resistance is too low ({min_res_val:g} Ω). Use at least 100 Ω.",
+                            comp_id=led.inst_id
+                        ))
+                elif min_res_val > 10000.0:
+                    issues.append(SafetyIssue(
+                        severity="warning",
+                        message=f"Practicality Warning: LED '{led.comp_def.type_name}' ({led.inst_id}) series resistance is too high ({min_res_val/1000.0:g} kΩ). LED will be very dim or off.",
+                        comp_id=led.inst_id
+                    ))
+            elif reverse_power and reverse_gnd:
+                issues.append(SafetyIssue(
+                    severity="warning",
+                    message=f"Reverse Polarity Warning! LED '{led.comp_def.type_name}' ({led.inst_id}) is connected with reverse polarity (Cathode is connected to Power/GPIO, Anode is connected to Ground/GPIO). The LED will not light up.",
+                    comp_id=led.inst_id
+                ))
+
+        # ── 3. Pushbutton Short Circuit on Press Check ────────────────────────
+        buttons = [pc for pc in self.components if pc.comp_def.type_name == "4-Pin Button"]
+        for btn in buttons:
+            bcps = btn.connection_points()
+            # Side A is index 0 and 1 (A1, A2)
+            # Side B is index 2 and 3 (B1, B2)
+            if len(bcps) >= 4:
+                # We can check side A nets and side B nets
+                side_A_nets = set(cp_to_net.get(bcps[i][1]) for i in (0, 1) if cp_to_net.get(bcps[i][1]) is not None)
+                side_B_nets = set(cp_to_net.get(bcps[i][1]) for i in (2, 3) if cp_to_net.get(bcps[i][1]) is not None)
+
+                if side_A_nets and side_B_nets:
+                    # Find all power/GND sources reachable via resistors from Side A and Side B
+                    side_A_power = False
+                    side_A_gnd = False
+                    side_B_power = False
+                    side_B_gnd = False
+
+                    # Run BFS/Dijkstra from any of Side A nets
+                    side_A_dists = {}
+                    for san in side_A_nets:
+                        side_A_dists.update(find_path_resistance(san))
+                    side_B_dists = {}
+                    for sbn in side_B_nets:
+                        side_B_dists.update(find_path_resistance(sbn))
+
+                    # We check if Side A can reach power with 0 ohms, and Side B can reach GND with 0 ohms (or vice versa)
+                    # Let's inspect each net for sources:
+                    for nid, cps in nets.items():
+                        has_power = False
+                        has_gnd = False
+                        for cp in cps:
+                            if cp[0] == "pin":
+                                inst_id, pin_key = cp[1], cp[2]
+                                pc = self.get_component(inst_id)
+                                if pc and pc.comp_def.category == "controller":
+                                    pin_idx = int(pin_key.split("__")[0])
+                                    ptype = pc.comp_def.all_pins[pin_idx].ptype
+                                    if ptype == PT_POWER:
+                                        has_power = True
+                                    elif ptype == PT_GND:
+                                        has_gnd = True
+                            elif cp[0] == "hole":
+                                for pc in self.components:
+                                    if pc.comp_def.category == "controller" and pc.on_board:
+                                        for i, (label, cp_pin) in enumerate(pc.connection_points()):
+                                            if cp_pin == cp:
+                                                ptype = pc.comp_def.all_pins[i].ptype
+                                                if ptype == PT_POWER:
+                                                    has_power = True
+                                                elif ptype == PT_GND:
+                                                    has_gnd = True
+
+                        if has_power:
+                            if nid in side_A_dists and side_A_dists[nid] < 100.0:
+                                side_A_power = True
+                            if nid in side_B_dists and side_B_dists[nid] < 100.0:
+                                side_B_power = True
+                        if has_gnd:
+                            if nid in side_A_dists and side_A_dists[nid] < 100.0:
+                                side_A_gnd = True
+                            if nid in side_B_dists and side_B_dists[nid] < 100.0:
+                                side_B_gnd = True
+
+                    # Short hazard exists if:
+                    # (Side A has Power with 0 resistors AND Side B has GND with 0 resistors) OR
+                    # (Side A has GND with 0 resistors AND Side B has Power with 0 resistors)
+                    if (side_A_power and side_B_gnd) or (side_A_gnd and side_B_power):
+                        issues.append(SafetyIssue(
+                            severity="critical",
+                            message=f"Short Circuit Hazard! Pushbutton '{btn.comp_def.type_name}' ({btn.inst_id}) connects Power directly to Ground with no resistor when pressed.",
+                            comp_id=btn.inst_id
+                        ))
+
+
+        return issues
+
