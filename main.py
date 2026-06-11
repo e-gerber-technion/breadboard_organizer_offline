@@ -161,7 +161,7 @@ def build_export(state: BoardState) -> dict:
     # Component list with GND-connection check
     component_list = []
     for pc in state.components:
-        if pc.comp_def.category == "controller":
+        if pc.comp_def.category == "controller" and (ctrl is not None and pc.inst_id == ctrl.inst_id):
             continue
         pins_info = []
         for i, (label, cp) in enumerate(pc.connection_points()):
@@ -513,15 +513,6 @@ class App(tk.Tk):
         if not sel:
             return
         cd = self._filtered[sel[0]]
-        # If user tries to place a second controller, warn
-        if cd.category == "controller" and self.state.controller() is not None:
-            if not messagebox.askyesno(
-                    "Replace controller?",
-                    "A controller is already on the board. Replace it?"):
-                return
-            old = self.state.controller()
-            if old:
-                self.state.remove_component(old.inst_id)
         self._set_mode(MODE_PLACE, placing_def=cd)
 
     # ── Mode & status ─────────────────────────────────────────────────────────

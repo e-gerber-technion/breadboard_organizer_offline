@@ -709,6 +709,223 @@ class BoardState:
                             comp_id=btn.inst_id
                         ))
 
+        # ── 4. Logic Level Voltage Mismatch Check ─────────────────────────────
+        net_signal_pins = {}
+        for nid, cps in nets.items():
+            net_signal_pins[nid] = []
+            for cp in cps:
+                pc = None
+                pin_def = None
+                pin_name = None
+                if cp[0] == "pin":
+                    inst_id, pin_key = cp[1], cp[2]
+                    pc = self.get_component(inst_id)
+                    if pc:
+                        pin_idx = int(pin_key.split("__")[0])
+                        pin_def = pc.comp_def.all_pins[pin_idx]
+                        pin_name = pin_def.name
+                elif cp[0] == "hole":
+                    row, col = cp[1], cp[2]
+                    for other_pc in self.components:
+                        if other_pc.on_board:
+                            for i, (label, cp_pin) in enumerate(other_pc.connection_points()):
+                                if cp_pin == cp:
+                                    pc = other_pc
+                                    pin_def = pc.comp_def.all_pins[i]
+                                    pin_name = pin_def.name
+                                    break
+                if pc and pin_def:
+                    if pc.comp_def.category not in {"passive", "led"} and pc.comp_def.type_name != "4-Pin Button":
+                        if pin_def.ptype not in (PT_GND, PT_POWER) and pin_def.ptype in {
+                            "io", "digital", "analog", "pwm", "i2c_scl", "i2c_sda"
+                        }:
+                            net_signal_pins[nid].append((pc, pin_def, pin_name))
+
+        for nid, sig_pins in net_signal_pins.items():
+            voltages = {}
+            for pc, pin_def, pin_name in sig_pins:
+                v = getattr(pc.comp_def, "logic_voltage", 3.3)
+                voltages.setdefault(v, []).append((pc, pin_name))
+            if len(voltages) > 1:
+                conflict_desc = []
+                for volt, list_pins in sorted(voltages.items()):
+                    pins_desc = ", ".join(f"{pc.comp_def.type_name} {name}" for pc, name in list_pins)
+                    conflict_desc.append(f"{volt}V ({pins_desc})")
+                issues.append(SafetyIssue(
+                    severity="warning",
+                    message=f"Logic Level Mismatch on Net {nid}! Different signal voltages are connected directly together: {'; '.join(conflict_desc)}. Connecting 5V signals directly to 3.3V pins can damage components.",
+                    net_id=nid
+                ))
+
+        # ── 5. GPIO Output Short Hazard (GPIO Output Pin Conflicts) ───────────
+        for nid, sig_pins in net_signal_pins.items():
+            ctrl_io_pins = []
+            for pc, pin_def, pin_name in sig_pins:
+                if pc.comp_def.category == "controller" and pin_def.ptype in {"io", "digital", "pwm"}:
+                    ctrl_io_pins.append((pc, pin_name))
+            if len(ctrl_io_pins) > 1:
+                pins_desc = ", ".join(f"{pc.comp_def.type_name} {name}" for pc, name in ctrl_io_pins)
+                issues.append(SafetyIssue(
+                    severity="warning",
+                    message=f"GPIO Conflict Hazard on Net {nid}! Multiple configurable output pins ({pins_desc}) are connected directly. If one is driven HIGH and another LOW in software, it will create a short circuit.",
+                    net_id=nid
+                ))
+
+        # ── 6. Floating Inputs (Pushbutton Pull-up/Pull-down Check) ───────────
+        buttons = [pc for pc in self.components if pc.comp_def.type_name == "4-Pin Button"]
+        for btn in buttons:
+            bcps = btn.connection_points()
+            if len(bcps) < 4:
+                continue
+            nets_A = set(cp_to_net.get(cp[1]) for label, cp in bcps[:2] if cp_to_net.get(cp[1]) is not None)
+            nets_B = set(cp_to_net.get(cp[1]) for label, cp in bcps[2:] if cp_to_net.get(cp[1]) is not None)
+            
+            for side_nets, side_label in [(nets_A, "Side A"), (nets_B, "Side B")]:
+                for nid in side_nets:
+                    for pc, pin_def, pin_name in net_signal_pins.get(nid, []):
+                        if pc.comp_def.category == "controller" and pin_def.ptype in {"io", "digital", "pwm", "analog"}:
+                            paths = find_path_resistance(nid)
+                            has_pull_resistor = False
+                            for path_nid, path_res in paths.items():
+                                for cp in nets.get(path_nid, []):
+                                    c_pc = None
+                                    pt = None
+                                    if cp[0] == "pin":
+                                        c_pc = self.get_component(cp[1])
+                                        if c_pc:
+                                            p_idx = int(cp[2].split("__")[0])
+                                            pt = c_pc.comp_def.all_pins[p_idx].ptype
+                                    elif cp[0] == "hole":
+                                        for search_pc in self.components:
+                                            if search_pc.on_board:
+                                                for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
+                                                    if cp_pin == cp:
+                                                        c_pc = search_pc
+                                                        pt = c_pc.comp_def.all_pins[i].ptype
+                                                        break
+                                    if c_pc and pt in {"power", "gnd"}:
+                                        has_pull_resistor = True
+                                        break
+                                if has_pull_resistor:
+                                    break
+                            if not has_pull_resistor:
+                                issues.append(SafetyIssue(
+                                    severity="warning",
+                                    message=f"Floating Input Warning! Pin '{pc.comp_def.type_name} {pin_name}' is connected to pushbutton '{btn.inst_id}' ({side_label}) but its net lacks a pull-up/pull-down resistor. If the button is open, the input will float. Enable the internal pull-up in code (e.g. `INPUT_PULLUP`) or add a resistor.",
+                                    comp_id=btn.inst_id
+                                ))
+
+        # ── 7. Missing I2C Pull-ups Check ─────────────────────────────────────
+        for nid, cps in nets.items():
+            i2c_pins = []
+            for cp in cps:
+                c_pc = None
+                p_def = None
+                if cp[0] == "pin":
+                    c_pc = self.get_component(cp[1])
+                    if c_pc:
+                        p_idx = int(cp[2].split("__")[0])
+                        p_def = c_pc.comp_def.all_pins[p_idx]
+                elif cp[0] == "hole":
+                    for search_pc in self.components:
+                        if search_pc.on_board:
+                            for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
+                                if cp_pin == cp:
+                                    c_pc = search_pc
+                                    p_def = search_pc.comp_def.all_pins[i]
+                                    break
+                if c_pc and p_def and p_def.ptype in {"i2c_sda", "i2c_scl"}:
+                    i2c_pins.append((c_pc, p_def))
+
+            if i2c_pins and len(cps) > 1:
+                paths = find_path_resistance(nid)
+                has_pullup = False
+                for path_nid, path_res in paths.items():
+                    if path_res > 0:
+                        for cp in nets.get(path_nid, []):
+                            c_pc = None
+                            pt = None
+                            if cp[0] == "pin":
+                                c_pc = self.get_component(cp[1])
+                                if c_pc:
+                                    p_idx = int(cp[2].split("__")[0])
+                                    pt = c_pc.comp_def.all_pins[p_idx].ptype
+                            elif cp[0] == "hole":
+                                for search_pc in self.components:
+                                    if search_pc.on_board:
+                                        for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
+                                            if cp_pin == cp:
+                                                c_pc = search_pc
+                                                pt = c_pc.comp_def.all_pins[i].ptype
+                                                break
+                            if c_pc and pt == "power":
+                                has_pullup = True
+                                break
+                        if has_pullup:
+                            break
+                if not has_pullup:
+                    pins_desc = ", ".join(f"{pc.comp_def.type_name} {pin.name}" for pc, pin in i2c_pins)
+                    issues.append(SafetyIssue(
+                        severity="warning",
+                        message=f"Missing I2C Pull-up! I2C net {nid} ({pins_desc}) lacks a pull-up resistor to a power rail (VCC/3.3V/5V). Open-drain I2C lines require pull-up resistors (typically 4.7k Ω) to pull the lines high.",
+                        net_id=nid
+                    ))
+
+        # ── 8. Overvoltage & Direct Power Connection to Signal Check ─────────
+        for nid, cps in nets.items():
+            power_pins_in_net = []
+            signal_pins_in_net = []
+            for cp in cps:
+                c_pc = None
+                p_def = None
+                if cp[0] == "pin":
+                    c_pc = self.get_component(cp[1])
+                    if c_pc:
+                        p_idx = int(cp[2].split("__")[0])
+                        p_def = c_pc.comp_def.all_pins[p_idx]
+                elif cp[0] == "hole":
+                    for search_pc in self.components:
+                        if search_pc.on_board:
+                            for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
+                                if cp_pin == cp:
+                                    c_pc = search_pc
+                                    p_def = search_pc.comp_def.all_pins[i]
+                                    break
+                if c_pc and p_def:
+                    if p_def.ptype == PT_POWER:
+                        power_pins_in_net.append((c_pc, p_def))
+                    elif p_def.ptype in {"io", "digital", "analog", "pwm", "i2c_scl", "i2c_sda"}:
+                        if c_pc.comp_def.category not in {"passive", "led"} and c_pc.comp_def.type_name != "4-Pin Button":
+                            signal_pins_in_net.append((c_pc, p_def))
+
+            if power_pins_in_net and signal_pins_in_net:
+                for s_pc, s_pin in signal_pins_in_net:
+                    s_volt = getattr(s_pc.comp_def, "logic_voltage", 3.3)
+                    for p_pc, p_pin in power_pins_in_net:
+                        p_name = p_pin.name.upper()
+                        if "5V" in p_name:
+                            p_volt = 5.0
+                        elif "3.3V" in p_name or "3V3" in p_name:
+                            p_volt = 3.3
+                        elif "VIN" in p_name:
+                            p_volt = 9.0
+                        else:
+                            p_volt = getattr(p_pc.comp_def, "logic_voltage", 3.3)
+
+                        if p_volt > s_volt:
+                            issues.append(SafetyIssue(
+                                severity="critical",
+                                message=f"Overvoltage Hazard! GPIO Pin '{s_pc.comp_def.type_name} {s_pin.name}' ({s_volt}V logic) is connected directly to Power Pin '{p_pc.comp_def.type_name} {p_pin.name}' ({p_volt}V). This will damage the pin.",
+                                comp_id=s_pc.inst_id,
+                                net_id=nid
+                            ))
+                        else:
+                            issues.append(SafetyIssue(
+                                severity="warning",
+                                message=f"Direct Power Connection Warning! GPIO Pin '{s_pc.comp_def.type_name} {s_pin.name}' is connected directly to Power Pin '{p_pc.comp_def.type_name} {p_pin.name}'. If the pin is configured as output driven LOW in code, it will cause a short circuit. Use a pull-up resistor instead.",
+                                comp_id=s_pc.inst_id,
+                                net_id=nid
+                            ))
 
         return issues
 

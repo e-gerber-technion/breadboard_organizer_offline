@@ -40,6 +40,7 @@ class ComponentDef:
     # Pins in the *right* column (top→bottom). Non-empty ⇒ straddles the gap.
     right_pins:  List[PinDef] = field(default_factory=list)
     description: str = ""
+    logic_voltage: float = 3.3  # Operating/logic voltage of the component
 
     # ── derived helpers ───────────────────────────────────────────────────────
     @property
@@ -103,6 +104,7 @@ ARDUINO_UNO_R3 = ComponentDef(
         P("D0/RX",      PT_DIGITAL),
     ],
     description = "Arduino UNO R3 – 5 V, AVR ATmega328P",
+    logic_voltage = 5.0,
 )
 
 ESP32_WROOM = ComponentDef(
@@ -152,6 +154,7 @@ ESP32_WROOM = ComponentDef(
         P("GPIO7/SD0",    PT_IO),
     ],
     description = "ESP-WROOM-32 – Wi-Fi/BT, 3.3 V",
+    logic_voltage = 3.3,
 )
 
 TEENSY_40 = ComponentDef(
@@ -211,6 +214,7 @@ TEENSY_40 = ComponentDef(
         P("GND",         PT_GND),
     ],
     description = "Teensy 4.0 – ARM Cortex-M7, 3.3 V",
+    logic_voltage = 3.3,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -228,6 +232,7 @@ OLED_JMD096D1 = ComponentDef(
         P("SDA", PT_I2C_SDA),
     ],
     description = "0.96\" 128×64 I²C OLED display",
+    logic_voltage = 3.3,
 )
 
 PUSHBUTTON_4PIN = ComponentDef(

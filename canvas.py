@@ -117,18 +117,27 @@ class Layout:
                      occupied: Dict = None) -> Optional[Tuple[int, str]]:
         hs      = self._hs
         snap_r  = hs * 0.65
+
+        # 1. Row math - snap directly to closest row
+        row = round((py - self.grid_y0) / hs) + 1
+        if not (1 <= row <= self.num_rows):
+            return None
+
+        cy = self.grid_y0 + (row - 1) * hs
+        dy = cy - py
+        if abs(dy) > snap_r:
+            return None
+
         best_d  = snap_r
         best    = None
+        # 2. Check 10 columns only
         for col in ALL_COLS:
             cx = self.grid_x0 + COL_X_IDX[col] * hs
-            if abs(cx - px) > snap_r:
-                continue
-            for row in range(1, self.num_rows + 1):
-                cy = self.grid_y0 + (row - 1) * hs
-                d  = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-                if d < best_d:
-                    best_d = d
-                    best   = (row, col)
+            dx = cx - px
+            d  = (dx * dx + dy * dy) ** 0.5
+            if d < best_d:
+                best_d = d
+                best   = (row, col)
         return best
 
     def nearest_rail_hole(self, px: float, py: float
@@ -141,19 +150,27 @@ class Layout:
             RAIL_RIGHT_PLUS:  self._right_plus_x,
             RAIL_RIGHT_MINUS: self._right_minus_x,
         }
+
+        # 1. Row index math
+        idx = round((py - self.grid_y0) / hs)
+        if not (0 <= idx < self.num_rows):
+            return None
+
+        ry = self.grid_y0 + idx * hs
+        dy = ry - py
+        if abs(dy) > snap_r:
+            return None
+
         best_d = snap_r
         best   = None
         for rail_id, rx in x_map.items():
             if not self.rails_visible.get(rail_id, True):
                 continue
-            if abs(rx - px) > snap_r:
-                continue
-            for idx in range(self.num_rows):
-                ry = self.grid_y0 + idx * hs
-                d  = ((rx - px) ** 2 + (ry - py) ** 2) ** 0.5
-                if d < best_d:
-                    best_d = d
-                    best   = (rail_id, idx)
+            dx = rx - px
+            d  = (dx * dx + dy * dy) ** 0.5
+            if d < best_d:
+                best_d = d
+                best   = (rail_id, idx)
         return best
 
     def board_hit(self, px: float, py: float) -> bool:
@@ -199,6 +216,7 @@ class BreadboardCanvas(tk.Frame):
         self._zoom      = 1.0
         self._board_ox  = 100.0
         self._board_oy  = 60.0
+        self._initialized = False
 
         # Interaction state
         self._mode:               str  = MODE_SELECT
@@ -317,11 +335,27 @@ class BreadboardCanvas(tk.Frame):
         self.layout.update(self.state.num_rows, self.state.rails_visible,
                            zoom=self._zoom,
                            board_ox=self._board_ox, board_oy=self._board_oy)
-        self.redraw()
+        self.redraw(full=True)
 
-    def redraw(self) -> None:
-        self._canvas.delete("all")
-        self._draw_board()
+    def redraw(self, full: bool = False) -> None:
+        if not self._initialized or full:
+            self._canvas.delete("all")
+            self._draw_board()
+            self._initialized = True
+        else:
+            self._canvas.delete("comp")
+            self._canvas.delete("wire")
+            self._canvas.delete("pin_dot")
+            self._canvas.delete("hole_pin")
+            self._canvas.delete("ghost")
+            self._canvas.delete("ghost_wire")
+            
+            # Update grid occupied holes using itemconfig (extremely fast)
+            self._canvas.itemconfig("hole", fill=C_HOLE)
+            occ = self.state.occupied_holes()
+            for row, col in occ:
+                self._canvas.itemconfig(f"hole_{row}_{col}", fill=C_HOLE_OCCUPIED)
+
         self._draw_components()
         self._draw_wires()
         # Update scroll region to encompass everything
@@ -488,7 +522,7 @@ class BreadboardCanvas(tk.Frame):
             c.create_text((x0 + x1) / 2, (y0 + y1) / 2,
                           text=cd.type_name.split()[0],
                           font=("Helvetica", max(6, int(7 * z))), fill=tc,
-                          tags=f"comp_{pc.inst_id}")
+                          tags=("comp", f"comp_{pc.inst_id}"))
             # Pin dots + labels – labels float above the hole ON THE BOARD SURFACE
             lbl_fnt = ("Helvetica", max(6, int(7 * z)))
             for i, (label, cp) in enumerate(pc.connection_points()):
@@ -504,7 +538,7 @@ class BreadboardCanvas(tk.Frame):
                     ltx = hx
                     c.create_text(ltx, lty, text=label, font=lbl_fnt,
                                   fill=self._label_color(ltx, lty),
-                                  tags=f"comp_{pc.inst_id}")
+                                  tags=("comp", f"comp_{pc.inst_id}"))
         else:
             # ── DIP: straddles the centre gap ─────────────────────────────────
             rotated = getattr(pc, "rotated", False)
@@ -538,7 +572,7 @@ class BreadboardCanvas(tk.Frame):
                           text=cd.type_name,
                           font=("Helvetica", max(7, int(8 * z)), "bold"),
                           fill=tc, width=bx1 - bx0 - 8,
-                          tags=f"comp_{pc.inst_id}")
+                          tags=("comp", f"comp_{pc.inst_id}"))
 
             # ── Pin-1 gold stripe ─────────────────────────────────────────────
             # Drawn on whichever column pin[0] occupies after flip.
@@ -549,11 +583,11 @@ class BreadboardCanvas(tk.Frame):
                 if p0_col in LEFT_COLS:
                     c.create_rectangle(bx0, by0, bx0 + sw, by1,
                                        fill="#FFD700", outline="",
-                                       tags=f"comp_{pc.inst_id}")
+                                       tags=("comp", f"comp_{pc.inst_id}"))
                 else:
                     c.create_rectangle(bx1 - sw, by0, bx1, by1,
                                        fill="#FFD700", outline="",
-                                       tags=f"comp_{pc.inst_id}")
+                                       tags=("comp", f"comp_{pc.inst_id}"))
 
             # ── Pin dots + labels ─────────────────────────────────────────────
             lbl_fnt = ("Helvetica", max(6, int(7 * z)))
@@ -576,22 +610,22 @@ class BreadboardCanvas(tk.Frame):
                     if cp[1] == pc.anchor_row:
                         c.create_text(hx, top_ty, text=label, font=lbl_fnt,
                                       fill=tc, anchor="n",
-                                      tags=f"comp_{pc.inst_id}")
+                                      tags=("comp", f"comp_{pc.inst_id}"))
                     else:
                         c.create_text(hx, bottom_ty, text=label, font=lbl_fnt,
                                       fill=tc, anchor="s",
-                                      tags=f"comp_{pc.inst_id}")
+                                      tags=("comp", f"comp_{pc.inst_id}"))
                 else:
                     # Choose side based on which column the hole is in RIGHT NOW
                     # (reflects flip correctly without any extra state check)
                     if cp[2] in LEFT_COLS:
                         c.create_text(left_tx, hy, text=label, font=lbl_fnt,
                                       fill=tc, anchor="w",
-                                      tags=f"comp_{pc.inst_id}")
+                                      tags=("comp", f"comp_{pc.inst_id}"))
                     else:
                         c.create_text(right_tx, hy, text=label, font=lbl_fnt,
                                       fill=tc, anchor="e",
-                                      tags=f"comp_{pc.inst_id}")
+                                      tags=("comp", f"comp_{pc.inst_id}"))
 
     def _draw_offboard_component(self, pc: PlacedComponent) -> None:
         c   = self._canvas
@@ -631,17 +665,17 @@ class BreadboardCanvas(tk.Frame):
             if not pc.flipped:
                 c.create_rectangle(x0, y0, x0 + sw, y1,
                                    fill="#FFD700", outline="",
-                                   tags=f"comp_{pc.inst_id}")
+                                   tags=("comp", f"comp_{pc.inst_id}"))
             else:
                 c.create_rectangle(x1 - sw, y0, x1, y1,
                                    fill="#FFD700", outline="",
-                                   tags=f"comp_{pc.inst_id}")
+                                   tags=("comp", f"comp_{pc.inst_id}"))
 
         c.create_text((x0 + x1) / 2, (y0 + y1) / 2,
                       text=cd.type_name,
                       font=("Helvetica", max(7, int(8 * z)), "bold"),
                       fill=tc, width=body_w - 4,
-                      tags=f"comp_{pc.inst_id}")
+                      tags=("comp", f"comp_{pc.inst_id}"))
 
         # Pin circles with labels
         offset = len(cd.left_pins)
@@ -681,7 +715,7 @@ class BreadboardCanvas(tk.Frame):
             c.create_text(ltx, py_pin,
                           text=pin.name, font=fnt,
                           anchor="e", fill=self._label_color(ltx, py_pin),
-                          tags=f"comp_{pc.inst_id}")
+                          tags=("comp", f"comp_{pc.inst_id}"))
             pc._pin_positions[orig_idx] = (x0, py_pin)    # type: ignore[attr-defined]
 
         for idx, (orig_idx, pin) in enumerate(right_draw):
@@ -695,7 +729,7 @@ class BreadboardCanvas(tk.Frame):
             c.create_text(ltx, py_pin,
                           text=pin.name, font=fnt,
                           anchor="w", fill=self._label_color(ltx, py_pin),
-                          tags=f"comp_{pc.inst_id}")
+                          tags=("comp", f"comp_{pc.inst_id}"))
             pc._pin_positions[orig_idx] = (x1, py_pin)   # type: ignore[attr-defined]
 
 
@@ -864,10 +898,12 @@ class BreadboardCanvas(tk.Frame):
             self.state.remove_component(self._selected_comp)
             self._selected_comp = None
             self.redraw()
+            self.on_change()
         elif self._selected_wire:
             self.state.remove_wire(self._selected_wire)
             self._selected_wire = None
             self.redraw()
+            self.on_change()
 
     def _on_zoom_scroll(self, event) -> None:
         if event.num == 4 or event.delta > 0:
@@ -954,42 +990,30 @@ class BreadboardCanvas(tk.Frame):
         tx  = cx - self._drag_off[0]
         ty  = cy - self._drag_off[1]
 
-        if pc.on_board:
-            snap = lay.nearest_hole(tx, ty)
-            if snap:
-                new_row, new_col = snap
-                if pc.comp_def.category == "controller" and new_col in RIGHT_COLS:
-                    new_col = MIRROR_COL[new_col]
-                if new_row != pc.anchor_row or new_col != pc.anchor_col:
-                    pc.anchor_row = new_row
-                    pc.anchor_col = new_col
-                    pc.compute_pin_holes()
-                    self.redraw()
+        snap = lay.nearest_hole(tx, ty)
+        if snap and lay.board_hit(cx, cy):
+            new_row, new_col = snap
+            if pc.comp_def.category == "controller" and new_col in RIGHT_COLS:
+                new_col = MIRROR_COL[new_col]
+            pc.on_board = True
+            pc.anchor_row = new_row
+            pc.anchor_col = new_col
+            pc.compute_pin_holes()
         else:
-            # Convert target canvas coords to world
+            pc.on_board = False
             wx, wy = lay.to_world(tx, ty)
             pc.x = wx
             pc.y = wy
-            self.redraw()
+            pc.compute_pin_holes()
+        self.redraw()
 
     def _handle_comp_drop(self, cx: float, cy: float) -> None:
         pc  = self.state.get_component(self._drag_comp)
         if not pc:
             return
-        lay = self.layout
-        if lay.board_hit(cx, cy):
-            snap = lay.nearest_hole(cx - self._drag_off[0], cy - self._drag_off[1])
-            if snap:
-                new_row, new_col = snap
-                if pc.comp_def.category == "controller" and new_col in RIGHT_COLS:
-                    new_col = MIRROR_COL[new_col]
-                self.state.move_component_on_board(pc.inst_id, new_row, new_col)
-        else:
-            sx = cx - self._drag_off[0]
-            sy = cy - self._drag_off[1]
-            wx, wy = lay.to_world(sx, sy)
-            self.state.move_component_off_board(pc.inst_id, wx, wy)
+        pc.compute_pin_holes()
         self.redraw()
+        self.on_change()
 
     def _handle_place(self, cx: float, cy: float) -> None:
         if self._placing_def is None:
@@ -1013,6 +1037,7 @@ class BreadboardCanvas(tk.Frame):
                        and h[1] in ALL_COLS for h in candidate):
                     self.state.add_component(cd, on_board=True,
                                              anchor_row=row, anchor_col=col, rotated=rotated)
+                    self.on_change()
                     self.on_status(f"Placed {cd.type_name} at row {row}, col {col}")
                 else:
                     self.on_status("Cannot place here – holes occupied or out of range")
@@ -1022,6 +1047,7 @@ class BreadboardCanvas(tk.Frame):
             min_wx = lay.offboard_default_world_x()
             wx = max(wx, min_wx)
             self.state.add_component(cd, on_board=False, x=wx, y=wy, rotated=rotated)
+            self.on_change()
             self.on_status(f"Placed {cd.type_name} off-board")
 
         self._canvas.delete("ghost")
@@ -1037,6 +1063,7 @@ class BreadboardCanvas(tk.Frame):
         else:
             if cp != self._wire_start:
                 self.state.add_wire(self._wire_start, cp, color=self._wire_color)
+                self.on_change()
                 self.on_status("Wire added")
                 self._wire_color = self.next_wire_color()
             self._wire_start = None
@@ -1061,12 +1088,14 @@ class BreadboardCanvas(tk.Frame):
             self.state.remove_wire(wire.wire_id)
             self.on_status(f"Deleted wire {wire.wire_id}")
             self.redraw()
+            self.on_change()
             return
         comp = self._hit_test_component(cx, cy)
         if comp:
             self.state.remove_component(comp.inst_id)
             self.on_status(f"Deleted {comp.comp_def.type_name}")
             self.redraw()
+            self.on_change()
 
     def _handle_divider_click(self, cx: float, cy: float) -> None:
         lay = self.layout
@@ -1088,7 +1117,8 @@ class BreadboardCanvas(tk.Frame):
             else:
                 self.state.dividers.add(best_row)
                 self.on_status(f"Added divider after row {best_row}")
-            self.redraw()
+            self.redraw(full=True)
+            self.on_change()
 
     def _cancel_action(self) -> None:
         self._wire_start  = None
@@ -1181,6 +1211,7 @@ class BreadboardCanvas(tk.Frame):
         if self._selected_comp == inst_id:
             self._selected_comp = None
         self.redraw()
+        self.on_change()
 
     def _ctx_flip(self, inst_id: str) -> None:
         pc = self.state.get_component(inst_id)
@@ -1188,6 +1219,7 @@ class BreadboardCanvas(tk.Frame):
             pc.flipped = not pc.flipped
             pc.compute_pin_holes()
             self.redraw()
+            self.on_change()
 
     def _ctx_move_off(self, inst_id: str) -> None:
         pc = self.state.get_component(inst_id)
@@ -1197,12 +1229,14 @@ class BreadboardCanvas(tk.Frame):
             wy = lay.to_world(0, lay.board_oy + 20)[1]
             self.state.move_component_off_board(inst_id, wx, wy)
             self.redraw()
+            self.on_change()
 
     def _ctx_delete_wire(self, wire_id: str) -> None:
         self.state.remove_wire(wire_id)
         if self._selected_wire == wire_id:
             self._selected_wire = None
         self.redraw()
+        self.on_change()
 
     def _ctx_wire_color(self, wire_id: str) -> None:
         w = self.state._wire_by_id.get(wire_id)
