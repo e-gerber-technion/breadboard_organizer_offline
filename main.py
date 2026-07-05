@@ -71,6 +71,7 @@ def build_export(state: BoardState) -> dict:
     """Build a JSON-serialisable dict describing the full board state."""
     nets     = state.compute_nets()
     gnd_ids  = state.gnd_net_ids(nets)
+    cp_to_net = {cp: nid for nid, cps in nets.items() for cp in cps}
 
     # Run safety checks
     issues = state.analyze_safety()
@@ -85,10 +86,19 @@ def build_export(state: BoardState) -> dict:
 
     # Helper: find net id for a CP
     def net_of(cp):
-        for nid, cps in nets.items():
-            if cp in cps:
-                return nid
-        return None
+        return cp_to_net.get(cp)
+
+    net_partner_pins = {}
+    for pc in state.components:
+        for label, cp in pc.connection_points():
+            nid = cp_to_net.get(cp)
+            if nid is None:
+                continue
+            net_partner_pins.setdefault(nid, []).append({
+                "component": pc.comp_def.type_name,
+                "instance": pc.inst_id,
+                "pin": label,
+            })
 
     # Build net descriptions
     net_descriptions = {}
@@ -120,35 +130,11 @@ def build_export(state: BoardState) -> dict:
             nid = net_of(cp)
             if nid is None:
                 continue
-            # Find all non-controller pins in this net
-            partners = []
-            for cp2 in nets[nid]:
-                if cp2 == cp:
-                    continue
-                if cp2[0] == "pin":
-                    other_id = cp2[1]
-                    other_pc = state.get_component(other_id)
-                    if other_pc and other_pc.inst_id != ctrl.inst_id:
-                        pin_key2 = cp2[2]
-                        pname2   = pin_key2.split("__", 1)[-1] if "__" in pin_key2 else pin_key2
-                        partners.append({
-                            "component": other_pc.comp_def.type_name,
-                            "instance":  other_id,
-                            "pin":       pname2,
-                        })
-                elif cp2[0] == "hole":
-                    # Check if any on-board component pin is at this hole
-                    r, c = cp2[1], cp2[2]
-                    for other_pc in state.components:
-                        if other_pc.inst_id == ctrl.inst_id:
-                            continue
-                        for j, (lbl2, cp3) in enumerate(other_pc.connection_points()):
-                            if cp3 == cp2:
-                                partners.append({
-                                    "component": other_pc.comp_def.type_name,
-                                    "instance":  other_pc.inst_id,
-                                    "pin":       lbl2,
-                                })
+            partners = [
+                partner
+                for partner in net_partner_pins.get(nid, [])
+                if partner["instance"] != ctrl.inst_id
+            ]
             ctrl_pin_info = ctrl.comp_def.all_pins[i] if i < len(ctrl.comp_def.all_pins) else None
             ctrl_connections.append({
                 "controller_pin": label,
@@ -190,6 +176,7 @@ def build_export(state: BoardState) -> dict:
             "anchor_col":   pc.anchor_col if pc.on_board else None,
             "rotated":      getattr(pc, "rotated", False),
             "flipped":      getattr(pc, "flipped", False),
+            "resistance_ohms": pc.resistance if pc.comp_def.type_name == "Resistor" else None,
             "gnd_warning":  expects_gnd and not gnd_pins_ok,
             "pins":         pins_info,
         })
@@ -601,17 +588,22 @@ class App(tk.Tk):
             lines.append("No controller placed.\n")
 
         for nid, cps in sorted(nets.items()):
-            # Only show non-trivial nets (>1 node, or containing a pin)
-            has_pin = any(cp[0] == "pin" for cp in cps)
-            if len(cps) <= 6 and not has_pin:
+            pin_lines = []
+            seen_pins = set()
+            for cp in sorted(cps, key=str):
+                for pc, _pin_def, pin_name in self.state.pin_refs_at_cp(cp):
+                    key = (pc.inst_id, pin_name)
+                    if key in seen_pins:
+                        continue
+                    seen_pins.add(key)
+                    pin_lines.append(f"  {pc.comp_def.type_name} · {pin_name}")
+
+            # Only show non-trivial nets (>1 node, or touching any component pin)
+            if len(cps) <= 6 and not pin_lines:
                 continue
             tag = " [GND]" if nid in gnd_ids else ""
             lines.append(f"Net {nid}{tag}:")
-            for cp in sorted(cps, key=str):
-                if cp[0] == "pin":
-                    pc = self.state.get_component(cp[1])
-                    cname = pc.comp_def.type_name if pc else "?"
-                    lines.append(f"  {cname} · {cp[2].split('__',1)[-1]}")
+            lines.extend(pin_lines)
             lines.append("")
 
         text = "\n".join(lines) if lines else "No notable nets yet."

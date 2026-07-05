@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import colorchooser
+from tkinter import colorchooser, simpledialog
 from typing import Callable, Dict, List, Optional, Tuple
 
 from constants import *
@@ -24,6 +24,18 @@ def contrast_color(hex_color: str) -> str:
 def _label_color_for(bg_hex: str) -> str:
     """Alias kept for clarity – same as contrast_color."""
     return contrast_color(bg_hex)
+
+
+def format_resistance_ohms(value: float) -> str:
+    """Format a resistance value for compact display."""
+    if value >= 1000:
+        kilo_ohms = value / 1000.0
+        if kilo_ohms.is_integer():
+            return f"{int(kilo_ohms)} kΩ"
+        return f"{kilo_ohms:.1f} kΩ"
+    if float(value).is_integer():
+        return f"{int(value)} Ω"
+    return f"{value:g} Ω"
 
 
 # ── Layout ─────────────────────────────────────────────────────────────────────
@@ -519,8 +531,11 @@ class BreadboardCanvas(tk.Frame):
             c.create_rectangle(x0, y0, x1, y1,
                                 fill=cd.color, outline=oc, width=ow,
                                 tags=("comp", f"comp_{pc.inst_id}"))
+            body_text = cd.type_name.split()[0]
+            if cd.type_name == "Resistor":
+                body_text = format_resistance_ohms(pc.resistance)
             c.create_text((x0 + x1) / 2, (y0 + y1) / 2,
-                          text=cd.type_name.split()[0],
+                          text=body_text,
                           font=("Helvetica", max(6, int(7 * z))), fill=tc,
                           tags=("comp", f"comp_{pc.inst_id}"))
             # Pin dots + labels – labels float above the hole ON THE BOARD SURFACE
@@ -672,7 +687,8 @@ class BreadboardCanvas(tk.Frame):
                                    tags=("comp", f"comp_{pc.inst_id}"))
 
         c.create_text((x0 + x1) / 2, (y0 + y1) / 2,
-                      text=cd.type_name,
+                    text=(f"Resistor\n{format_resistance_ohms(pc.resistance)}"
+                        if cd.type_name == "Resistor" else cd.type_name),
                       font=("Helvetica", max(7, int(8 * z)), "bold"),
                       fill=tc, width=body_w - 4,
                       tags=("comp", f"comp_{pc.inst_id}"))
@@ -1184,6 +1200,9 @@ class BreadboardCanvas(tk.Frame):
         if comp:
             menu.add_command(label=f"Delete  {comp.comp_def.type_name}",
                              command=lambda: self._ctx_delete_comp(comp.inst_id))
+            if comp.comp_def.type_name == "Resistor":
+                menu.add_command(label=f"Edit resistance…  ({format_resistance_ohms(comp.resistance)})",
+                                 command=lambda: self._ctx_edit_resistance(comp.inst_id))
             if comp.comp_def.is_dip:
                 menu.add_command(label="Flip left ↔ right",
                                  command=lambda: self._ctx_flip(comp.inst_id))
@@ -1230,6 +1249,24 @@ class BreadboardCanvas(tk.Frame):
             self.state.move_component_off_board(inst_id, wx, wy)
             self.redraw()
             self.on_change()
+
+    def _ctx_edit_resistance(self, inst_id: str) -> None:
+        pc = self.state.get_component(inst_id)
+        if not pc or pc.comp_def.type_name != "Resistor":
+            return
+        new_value = simpledialog.askfloat(
+            "Resistor value",
+            "Resistance in ohms:",
+            parent=self,
+            initialvalue=pc.resistance,
+            minvalue=0.1,
+        )
+        if new_value is None:
+            return
+        pc.resistance = new_value
+        self.redraw()
+        self.on_change()
+        self.on_status(f"Resistor set to {format_resistance_ohms(new_value)}")
 
     def _ctx_delete_wire(self, wire_id: str) -> None:
         self.state.remove_wire(wire_id)

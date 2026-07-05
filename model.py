@@ -70,15 +70,7 @@ class PlacedComponent:
         return f"{self.inst_id}__{pin_index}"
 
     def get_right_column(self, l_col: str) -> str:
-        if self.comp_def.type_name == "4-Pin Button":
-            try:
-                idx = ALL_COLS.index(l_col)
-                r_idx = min(idx + 2, len(ALL_COLS) - 1)
-                return ALL_COLS[r_idx]
-            except ValueError:
-                return l_col
-        else:
-            return MIRROR_COL.get(l_col, l_col)
+        return MIRROR_COL.get(l_col, l_col)
 
     def compute_pin_holes(self) -> None:
         """Populate self.pin_holes based on placement position."""
@@ -96,13 +88,18 @@ class PlacedComponent:
 
         if self.rotated:
             if cd.type_name == "4-Pin Button":
+                try:
+                    start_idx = ALL_COLS.index(l_col)
+                    same_side_col = ALL_COLS[min(start_idx + 2, len(ALL_COLS) - 1)]
+                except ValueError:
+                    same_side_col = l_col
                 # Rotated pushbutton spans rows:
                 # Side A (pins 0, 1) are at anchor_row, in l_col and r_col
                 # Side B (pins 2, 3) are at anchor_row + 2, in l_col and r_col
                 self.pin_holes[self.pin_key(0)] = (self.anchor_row, l_col)
-                self.pin_holes[self.pin_key(1)] = (self.anchor_row, r_col)
+                self.pin_holes[self.pin_key(1)] = (self.anchor_row, same_side_col)
                 self.pin_holes[self.pin_key(2)] = (self.anchor_row + 2, l_col)
-                self.pin_holes[self.pin_key(3)] = (self.anchor_row + 2, r_col)
+                self.pin_holes[self.pin_key(3)] = (self.anchor_row + 2, same_side_col)
             else:
                 # Place all pins horizontally starting from anchor_col
                 try:
@@ -263,6 +260,31 @@ class BoardState:
                 return pc
         return None
 
+    def _pin_index_from_key(self, pin_key: str) -> Optional[int]:
+        idx_str = pin_key.split("__", 1)[0]
+        return int(idx_str) if idx_str.isdigit() else None
+
+    def pin_refs_at_cp(self, cp: CP) -> List[Tuple[PlacedComponent, PinDef, str]]:
+        refs: List[Tuple[PlacedComponent, PinDef, str]] = []
+        if cp[0] == "pin":
+            pc = self.get_component(cp[1])
+            pin_idx = self._pin_index_from_key(cp[2])
+            if pc is not None and pin_idx is not None and pin_idx < len(pc.comp_def.all_pins):
+                pin_def = pc.comp_def.all_pins[pin_idx]
+                refs.append((pc, pin_def, pin_def.name))
+            return refs
+
+        if cp[0] != "hole":
+            return refs
+
+        for pc in self.components:
+            if not pc.on_board:
+                continue
+            for i, (label, cp_pin) in enumerate(pc.connection_points()):
+                if cp_pin == cp and i < len(pc.comp_def.all_pins):
+                    refs.append((pc, pc.comp_def.all_pins[i], label))
+        return refs
+
     # ── Wire management ───────────────────────────────────────────────────────
 
     def new_wire_id(self) -> str:
@@ -334,8 +356,13 @@ class BoardState:
 
         # 3. Component pin CPs (off-board only – on-board pins are just at holes)
         for pc in self.components:
-            for _label, cp in pc.connection_points():
+            cps = pc.connection_points()
+            for _label, cp in cps:
                 ensure(cp)
+
+            if pc.comp_def.type_name == "4-Pin Button" and len(cps) >= 4:
+                union(cps[0][1], cps[1][1])
+                union(cps[2][1], cps[3][1])
 
         # 4. Wires merge nets
         for w in self.wires:
@@ -361,25 +388,10 @@ class BoardState:
         if ctrl is None:
             return set()
         gnd_cps: Set[CP] = set()
-        for label, cp in ctrl.connection_points():
-            pin_idx = int(cp[2].split("__")[0]) if cp[0] == "pin" else -1
-            # Check by ptype
-            all_pins = ctrl.comp_def.all_pins
-            idx = int(cp[2].split("__")[0]) if cp[0] == "pin" else None
-            if cp[0] == "hole":
-                # find which pin index maps to this hole
-                for i, (lbl2, cp2) in enumerate(ctrl.connection_points()):
-                    if cp2 == cp:
-                        pd = all_pins[i]
-                        if pd.ptype == PT_GND:
-                            gnd_cps.add(cp)
-                        break
-            else:
-                i_str = cp[2].split("__")[0]
-                if i_str.isdigit():
-                    pd = all_pins[int(i_str)]
-                    if pd.ptype == PT_GND:
-                        gnd_cps.add(cp)
+        for _label, cp in ctrl.connection_points():
+            if any(pc.inst_id == ctrl.inst_id and pin_def.ptype == PT_GND
+                   for pc, pin_def, _pin_name in self.pin_refs_at_cp(cp)):
+                gnd_cps.add(cp)
 
         result = set()
         for net_id, cps in nets.items():
@@ -418,6 +430,22 @@ class BoardState:
         for iid in to_remove:
             self.remove_component(iid)
 
+        self.dividers = {dv for dv in self.dividers if 1 <= dv < num_rows}
+
+        invalid_wires = []
+        for wire in self.wires:
+            if self._cp_out_of_range(wire.start) or self._cp_out_of_range(wire.end):
+                invalid_wires.append(wire.wire_id)
+        for wire_id in invalid_wires:
+            self.remove_wire(wire_id)
+
+    def _cp_out_of_range(self, cp: CP) -> bool:
+        if cp[0] == "hole":
+            return not (1 <= cp[1] <= self.num_rows)
+        if cp[0] == "rail":
+            return not (0 <= cp[2] < self.num_rows)
+        return False
+
     def analyze_safety(self) -> List[SafetyIssue]:
         issues: List[SafetyIssue] = []
         nets = self.compute_nets()
@@ -436,33 +464,15 @@ class BoardState:
             io_pins = []
 
             for cp in cps:
-                if cp[0] == "pin":
-                    # Offboard component pin
-                    inst_id, pin_key = cp[1], cp[2]
-                    pc = self.get_component(inst_id)
-                    if pc and pc.comp_def.category == "controller":
-                        pin_idx = int(pin_key.split("__")[0])
-                        pin_def = pc.comp_def.all_pins[pin_idx]
-                        if pin_def.ptype == PT_GND:
-                            gnd_pins.append((pc, pin_def))
-                        elif pin_def.ptype == PT_POWER:
-                            power_pins.append((pc, pin_def))
-                        else:
-                            io_pins.append((pc, pin_def))
-                elif cp[0] == "hole":
-                    # Onboard component pin (we check if a controller pin maps to this hole)
-                    row, col = cp[1], cp[2]
-                    for pc in self.components:
-                        if pc.comp_def.category == "controller" and pc.on_board:
-                            for i, (label, cp_pin) in enumerate(pc.connection_points()):
-                                if cp_pin == cp:
-                                    pin_def = pc.comp_def.all_pins[i]
-                                    if pin_def.ptype == PT_GND:
-                                        gnd_pins.append((pc, pin_def))
-                                    elif pin_def.ptype == PT_POWER:
-                                        power_pins.append((pc, pin_def))
-                                    else:
-                                        io_pins.append((pc, pin_def))
+                for pc, pin_def, _pin_name in self.pin_refs_at_cp(cp):
+                    if pc.comp_def.category != "controller":
+                        continue
+                    if pin_def.ptype == PT_GND:
+                        gnd_pins.append((pc, pin_def))
+                    elif pin_def.ptype == PT_POWER:
+                        power_pins.append((pc, pin_def))
+                    else:
+                        io_pins.append((pc, pin_def))
 
             # Rules for direct short-circuit:
             if gnd_pins and power_pins:
@@ -564,34 +574,16 @@ class BoardState:
                 has_power = False
                 has_gnd = False
                 for cp in cps:
-                    # Check controller pins
-                    if cp[0] == "pin":
-                        inst_id, pin_key = cp[1], cp[2]
-                        pc = self.get_component(inst_id)
-                        if pc and pc.comp_def.category == "controller":
-                            pin_idx = int(pin_key.split("__")[0])
-                            ptype = pc.comp_def.all_pins[pin_idx].ptype
-                            if ptype == PT_POWER:
-                                has_power = True
-                            elif ptype == PT_GND:
-                                has_gnd = True
-                            else:
-                                # GPIO is potential power & GND
-                                has_power = True
-                                has_gnd = True
-                    elif cp[0] == "hole":
-                        for pc in self.components:
-                            if pc.comp_def.category == "controller" and pc.on_board:
-                                for i, (label, cp_pin) in enumerate(pc.connection_points()):
-                                    if cp_pin == cp:
-                                        ptype = pc.comp_def.all_pins[i].ptype
-                                        if ptype == PT_POWER:
-                                            has_power = True
-                                        elif ptype == PT_GND:
-                                            has_gnd = True
-                                        else:
-                                            has_power = True
-                                            has_gnd = True
+                    for pc, pin_def, _pin_name in self.pin_refs_at_cp(cp):
+                        if pc.comp_def.category != "controller":
+                            continue
+                        if pin_def.ptype == PT_POWER:
+                            has_power = True
+                        elif pin_def.ptype == PT_GND:
+                            has_gnd = True
+                        else:
+                            has_power = True
+                            has_gnd = True
 
                 if has_power:
                     if nid in anode_res:
@@ -667,26 +659,13 @@ class BoardState:
                         has_power = False
                         has_gnd = False
                         for cp in cps:
-                            if cp[0] == "pin":
-                                inst_id, pin_key = cp[1], cp[2]
-                                pc = self.get_component(inst_id)
-                                if pc and pc.comp_def.category == "controller":
-                                    pin_idx = int(pin_key.split("__")[0])
-                                    ptype = pc.comp_def.all_pins[pin_idx].ptype
-                                    if ptype == PT_POWER:
-                                        has_power = True
-                                    elif ptype == PT_GND:
-                                        has_gnd = True
-                            elif cp[0] == "hole":
-                                for pc in self.components:
-                                    if pc.comp_def.category == "controller" and pc.on_board:
-                                        for i, (label, cp_pin) in enumerate(pc.connection_points()):
-                                            if cp_pin == cp:
-                                                ptype = pc.comp_def.all_pins[i].ptype
-                                                if ptype == PT_POWER:
-                                                    has_power = True
-                                                elif ptype == PT_GND:
-                                                    has_gnd = True
+                            for pc, pin_def, _pin_name in self.pin_refs_at_cp(cp):
+                                if pc.comp_def.category != "controller":
+                                    continue
+                                if pin_def.ptype == PT_POWER:
+                                    has_power = True
+                                elif pin_def.ptype == PT_GND:
+                                    has_gnd = True
 
                         if has_power:
                             if nid in side_A_dists and side_A_dists[nid] < 100.0:
@@ -714,27 +693,7 @@ class BoardState:
         for nid, cps in nets.items():
             net_signal_pins[nid] = []
             for cp in cps:
-                pc = None
-                pin_def = None
-                pin_name = None
-                if cp[0] == "pin":
-                    inst_id, pin_key = cp[1], cp[2]
-                    pc = self.get_component(inst_id)
-                    if pc:
-                        pin_idx = int(pin_key.split("__")[0])
-                        pin_def = pc.comp_def.all_pins[pin_idx]
-                        pin_name = pin_def.name
-                elif cp[0] == "hole":
-                    row, col = cp[1], cp[2]
-                    for other_pc in self.components:
-                        if other_pc.on_board:
-                            for i, (label, cp_pin) in enumerate(other_pc.connection_points()):
-                                if cp_pin == cp:
-                                    pc = other_pc
-                                    pin_def = pc.comp_def.all_pins[i]
-                                    pin_name = pin_def.name
-                                    break
-                if pc and pin_def:
+                for pc, pin_def, pin_name in self.pin_refs_at_cp(cp):
                     if pc.comp_def.category not in {"passive", "led"} and pc.comp_def.type_name != "4-Pin Button":
                         if pin_def.ptype not in (PT_GND, PT_POWER) and pin_def.ptype in {
                             "io", "digital", "analog", "pwm", "i2c_scl", "i2c_sda"
@@ -777,8 +736,8 @@ class BoardState:
             bcps = btn.connection_points()
             if len(bcps) < 4:
                 continue
-            nets_A = set(cp_to_net.get(cp[1]) for label, cp in bcps[:2] if cp_to_net.get(cp[1]) is not None)
-            nets_B = set(cp_to_net.get(cp[1]) for label, cp in bcps[2:] if cp_to_net.get(cp[1]) is not None)
+            nets_A = set(cp_to_net.get(cp) for label, cp in bcps[:2] if cp_to_net.get(cp) is not None)
+            nets_B = set(cp_to_net.get(cp) for label, cp in bcps[2:] if cp_to_net.get(cp) is not None)
             
             for side_nets, side_label in [(nets_A, "Side A"), (nets_B, "Side B")]:
                 for nid in side_nets:
@@ -787,23 +746,11 @@ class BoardState:
                             paths = find_path_resistance(nid)
                             has_pull_resistor = False
                             for path_nid, path_res in paths.items():
+                                if path_res <= 0:
+                                    continue
                                 for cp in nets.get(path_nid, []):
-                                    c_pc = None
-                                    pt = None
-                                    if cp[0] == "pin":
-                                        c_pc = self.get_component(cp[1])
-                                        if c_pc:
-                                            p_idx = int(cp[2].split("__")[0])
-                                            pt = c_pc.comp_def.all_pins[p_idx].ptype
-                                    elif cp[0] == "hole":
-                                        for search_pc in self.components:
-                                            if search_pc.on_board:
-                                                for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
-                                                    if cp_pin == cp:
-                                                        c_pc = search_pc
-                                                        pt = c_pc.comp_def.all_pins[i].ptype
-                                                        break
-                                    if c_pc and pt in {"power", "gnd"}:
+                                    if any(pin_def.ptype in {PT_POWER, PT_GND}
+                                           for _c_pc, pin_def, _pin_name in self.pin_refs_at_cp(cp)):
                                         has_pull_resistor = True
                                         break
                                 if has_pull_resistor:
@@ -819,50 +766,23 @@ class BoardState:
         for nid, cps in nets.items():
             i2c_pins = []
             for cp in cps:
-                c_pc = None
-                p_def = None
-                if cp[0] == "pin":
-                    c_pc = self.get_component(cp[1])
-                    if c_pc:
-                        p_idx = int(cp[2].split("__")[0])
-                        p_def = c_pc.comp_def.all_pins[p_idx]
-                elif cp[0] == "hole":
-                    for search_pc in self.components:
-                        if search_pc.on_board:
-                            for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
-                                if cp_pin == cp:
-                                    c_pc = search_pc
-                                    p_def = search_pc.comp_def.all_pins[i]
-                                    break
-                if c_pc and p_def and p_def.ptype in {"i2c_sda", "i2c_scl"}:
-                    i2c_pins.append((c_pc, p_def))
+                for c_pc, p_def, _pin_name in self.pin_refs_at_cp(cp):
+                    if p_def.ptype in {"i2c_sda", "i2c_scl"}:
+                        i2c_pins.append((c_pc, p_def))
 
             if i2c_pins and len(cps) > 1:
                 paths = find_path_resistance(nid)
                 has_pullup = False
                 for path_nid, path_res in paths.items():
-                    if path_res > 0:
-                        for cp in nets.get(path_nid, []):
-                            c_pc = None
-                            pt = None
-                            if cp[0] == "pin":
-                                c_pc = self.get_component(cp[1])
-                                if c_pc:
-                                    p_idx = int(cp[2].split("__")[0])
-                                    pt = c_pc.comp_def.all_pins[p_idx].ptype
-                            elif cp[0] == "hole":
-                                for search_pc in self.components:
-                                    if search_pc.on_board:
-                                        for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
-                                            if cp_pin == cp:
-                                                c_pc = search_pc
-                                                pt = c_pc.comp_def.all_pins[i].ptype
-                                                break
-                            if c_pc and pt == "power":
-                                has_pullup = True
-                                break
-                        if has_pullup:
+                    if not (1000.0 <= path_res <= 10000.0):
+                        continue
+                    for cp in nets.get(path_nid, []):
+                        if any(pin_def.ptype == PT_POWER
+                               for _c_pc, pin_def, _pin_name in self.pin_refs_at_cp(cp)):
+                            has_pullup = True
                             break
+                    if has_pullup:
+                        break
                 if not has_pullup:
                     pins_desc = ", ".join(f"{pc.comp_def.type_name} {pin.name}" for pc, pin in i2c_pins)
                     issues.append(SafetyIssue(
@@ -876,22 +796,7 @@ class BoardState:
             power_pins_in_net = []
             signal_pins_in_net = []
             for cp in cps:
-                c_pc = None
-                p_def = None
-                if cp[0] == "pin":
-                    c_pc = self.get_component(cp[1])
-                    if c_pc:
-                        p_idx = int(cp[2].split("__")[0])
-                        p_def = c_pc.comp_def.all_pins[p_idx]
-                elif cp[0] == "hole":
-                    for search_pc in self.components:
-                        if search_pc.on_board:
-                            for i, (lbl, cp_pin) in enumerate(search_pc.connection_points()):
-                                if cp_pin == cp:
-                                    c_pc = search_pc
-                                    p_def = search_pc.comp_def.all_pins[i]
-                                    break
-                if c_pc and p_def:
+                for c_pc, p_def, _pin_name in self.pin_refs_at_cp(cp):
                     if p_def.ptype == PT_POWER:
                         power_pins_in_net.append((c_pc, p_def))
                     elif p_def.ptype in {"io", "digital", "analog", "pwm", "i2c_scl", "i2c_sda"}:
